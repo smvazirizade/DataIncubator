@@ -1,0 +1,209 @@
+---
+title: "Automatic Feature Selection for High-Dimensional Climate Data in Hurricane Predictive Modeling"
+output:
+  html_document:
+    toc: true # table of content true
+    toc_depth: 3  # upto three depths of headings 
+    number_sections: true  ## if you want number sections
+    theme: united  
+    highlight: tango
+    smart: false
+  pdf_document: default
+bibliography: HurricanePrediction.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data Explaination
+
+In their model, [@davis2015new] use three main indicators to predict the number of hurricanes in each year. These independent variables are:
+
+* Sea Surface Temperature (SST)
+* Pseudo-Wind Stress (PWS)
+* Multivariate ENSO Index (MEI)
+* Atlantic Multidecadal Oscillation (AMO)
+
+Adding the required library and importing files
+```{r required libraries, message = FALSE, warning = FALSE}
+library(httr)
+library(XML)
+library(RCurl)
+library(curl)
+library(ncdf4)
+library(ncdf4.helpers)
+library(glmnet)
+library(glmnetUtils)
+library(utils)
+library(graphics)
+```
+
+
+## Climate Time-Series Data
+Downloading the required data
+```{r downloading the data}
+# 
+# urlMEI <- "https://www.esrl.noaa.gov/psd/enso/mei/table.html"
+# #htmlMEI <- getURL(urlMEI)
+# htmlMEI <- readLines(curl(htmlMEI))
+# htmlMEI=sub(pattern="(^<html>.*?YEAR)", replacement="YEAR", x=htmlMEI)
+# htmlMEI=sub(pattern="\n\n\\(1\\).*\n", replacement="", x=htmlMEI)
+# cat(htmlMEI, file="MEI.txt")
+# DataMEI<-read.table("MEI.txt", header=TRUE, fill=TRUE)
+# 
+# 
+# urlAMO <- "https://www.esrl.noaa.gov/psd/data/correlation/amon.us.data"
+# #htmlAMO <- getURL(urlAMO)
+# htmlAMO <- readLines(curl(urlAMO))
+# htmlAMO <- sub(pattern="\n  -99.99\n  AMO.*\n$", replacement="", x=htmlAMO)
+# htmlAMO <- sub(pattern="\n  AMO.*\n$", replacement="", x=htmlAMO)
+# cat(htmlAMO, file="AMO.txt")
+# DataAMO<-read.table("AMO.txt", skip=1, fill=TRUE, col.names = c("YEAR",month.abb))
+
+```
+
+## Climate Field Data
+
+### Downloading and Reading in R
+A plethora of field datasets are available through the __Earth System Research Lobaratory__ and its __Physical Sciences Division__. Their webpage can be accessed from https://www.esrl.noaa.gov/psd/
+
+The file format of these files are netCDF or `.nc`. A lightweight tool can open and visualize these files called `panoply`, which can be downloaded from https://www.giss.nasa.gov/tools/panoply/
+
+Additionally, the library `ncdf4` in R allows loading and reading netCDF data. I followed the instruction [here](https://cran.r-project.org/web/packages/futureheatwaves/vignettes/starting_from_netcdf.html) for subsequent codings.
+
+### SST
+We downloaded the ``Montly Mean'' dataset from https://www.esrl.noaa.gov/psd/data/gridded/data.noaa.ersst.html
+
+Now, let us read the file and print its structure. First install `ncdf4`.
+
+Then we use the `nc_open` to open a connection (__it will not read the file into memory__).
+
+Printing the file will show a metadata about variables and other attributes.
+
+```{r}
+# download.file("ftp://ftp.cdc.noaa.gov/Datasets/noaa.ersst/sst.mnmean.v4.nc", destfile = "sst.mnmean.v4.nc",quiet=TRUE)
+```
+
+```{r}
+ncSST <- nc_open("sst.mnmean.v4.nc")
+#print(ncSST)
+```
+
+The time unit in netCDF data format is not the common `R` date format; compiling `ncSST$dim$time$units` returns: `r ncSST$dim$time$units`.
+### PWS
+
+```{r}
+# download.file("ftp://ftp.cdc.noaa.gov/Datasets/icoads/2degree/enh/upstr.mean.nc", destfile = "upstr.mean.nc", quite=TRUE)
+```
+```{r}
+ncPWS <- nc_open("upstr.mean.nc")
+#print(ncPWS)
+```
+
+```{r}
+CONVERSION <- function(FieldData){
+lon =ncvar_get(FieldData, varid="lon")
+lon = ifelse(lon > 180, -(360 - lon), lon)  # So that close to Atlantic, lon is continuous
+lat=ncvar_get(ncSST, varid="lat")
+t=ncvar_get(ncSST, varid="time")
+output <- list(lon=lon,lat=lat,t=t)
+return(output)
+}
+
+RegionAveragedFieldData <- function(FieldData,Region,Date){
+  #this function is calculating the average value of Field data in a region and time
+  List <- CONVERSION(FieldData)
+  lon <- List$lon
+  lat <- List$lat
+  t <- List$t
+  
+  t_index <- 12*(Date$year-1854)+Date$month
+  lon_index <- which(lon>=Region$lon1 & lon<=Region$lon2)
+  lat_index <- which(lat>=Region$lat1 & lat<=Region$lat2)
+  DataMatrix <- nc.get.var.subset.by.axes(FieldData, names(FieldData$var)[2], axis.indices = list(X=lon_index, Y=lat_index, T=t_index))[,,1]
+  ave <- sum(DataMatrix*(rep(1,length(lon_index))%*%t(cos(lat[lat_index]*pi/180))),   na.rm=TRUE)/sum(as.numeric(!is.na(DataMatrix))*(rep(1,length(lon_index))%*%t(cos(lat[lat_index]*pi/180))))
+  return(ave)
+}
+
+MonthRegionAveragedFieldData <- function(FieldData,Region,Date){
+  return(mean(sapply(Date$month, function(m){RegionAveragedFieldData(FieldData,Region,list(year=Date$year, month=m))})))
+}
+```
+### Utility Function
+
+```{r}
+years <- c(1950:2017)
+mydata = read.csv("ZengModelData.csv")
+
+ListSST <- CONVERSION(ncSST)
+lon <- ListSST$lon
+lat <- ListSST$lat
+t <- ListSST$t
+
+Region=list(lon1=-64, lon2=10, lat1=0, lat2=20)
+RegionAveragedFieldData(ncSST,Region,Date=list(year=2017, month=3))
+MonthRegionAveragedFieldData(ncSST,Region,Date=list(year=2017, month=3:5))
+ExtractedSST <- sapply(years,function(yr){MonthRegionAveragedFieldData(ncSST, Region, Date=list(year=yr, month=3:5))})
+plot(ExtractedSST,mydata$SST,asp=1); abline(0,1)
+
+```
+
+```{r}
+lonP <- seq(-100,20,by=10)
+latP <- seq(-10,60, by=10)
+
+SSTall <- matrix(0,length(years),(length(lonP)-1)*(length(latP)-1))
+Regions <- data.frame(lon1=0, lon2=0, lat1=0, lat2=0)
+
+for (i in 1:(length(lonP)-1)){
+  for (j in 1:(length(latP)-1)){
+    k=(i-1)*(length(latP)-1)+j
+    #Region <- list(lon1=lonP[i],lon2=lonP[i+1],lat1=latP[j],lat2=latP[j+1])
+    #Regions[k,] <- t(as.vector(Region))
+    Regions[k,] <- c(lon1=lonP[i],lon2=lonP[i+1],lat1=latP[j],lat2=latP[j+1])
+    SSTall[,k] <- sapply(years,function(yr){MonthRegionAveragedFieldData(ncSST, Region=as.list(Regions[k,]), Date=list(year=yr, month=3:5))})
+  }
+}
+
+for (i in 1:(length(lonP)-1)){
+  for (j in 1:(length(latP)-1)){
+    k=(i-1)*(length(latP)-1)+j
+    Regions[k,] <- c(lon1=lonP[i],lon2=lonP[i+1],lat1=latP[j],lat2=latP[j+1])
+  }
+}
+
+```
+
+```{r}
+library(glmnet)
+library(glmnetUtils)
+library(utils)
+
+ViableRegionIndex <- unique(which(!is.nan(SSTall), arr.ind=TRUE)[,2])
+X=SSTall[,ViableRegionIndex]
+X=cbind(X,mydata$PWS32)
+X=cbind(X,mydata$MEI_AMO)
+y=mydata$Hurricanes
+
+cvfit <- cv.glmnet(X[1:67,],y[1:67],family="poisson", nfolds=5,type.measure="mae")
+
+ChosenRegionIndex <- ViableRegionIndex[head(tail(which(abs(as.matrix(coef(cvfit,s=(cvfit$lambda.1se+cvfit$lambda.1se)/2)))>0.0001),-1)-1,-2)]
+Regions[ChosenRegionIndex,]
+
+library(graphics)
+
+op <- par()
+plot(0,0,xlim=c(lonP[1],tail(lonP,1)), ylim=c(latP[1],tail(latP,1)), type="n", xlab = "Longtitude", ylab = "Latitude")
+rect(lonP[1],latP[1],tail(lonP,1),tail(latP,1))
+for (k in 1:length(ChosenRegionIndex)){
+    rect(xleft=Regions[ChosenRegionIndex[k],1], ybottom = Regions[ChosenRegionIndex[k],3], xright=Regions[ChosenRegionIndex[k],2], ytop = Regions[ChosenRegionIndex[k],4])
+}
+
+```
+```{r}
+mydata$SSTopt = sapply(years,function(yr){MonthRegionAveragedFieldData(ncSST, Region = list(lon1=-60, lon2=-20 , lat1= 0, lat2= 10), Date=list(year=yr, month=3:5))})
+mydata$SSText = sapply(years,function(yr){MonthRegionAveragedFieldData(ncSST, Region = list(lon1=-60, lon2=10 , lat1= 0, lat2= 20), Date=list(year=yr, month=3:5))})
+mydata$Hurricanes2 = mydata$Hurricanes-2
+
+```
